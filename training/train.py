@@ -13,6 +13,7 @@ from agents.replay_buffer import ReplayBuffer
 from envs.combat_env import CombatEnv
 from logging_utils.episode_logger import EpisodeLogger
 from logging_utils.run_logger import start_run
+from training.evaluate import append_eval_log_row, rollout
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 
@@ -30,26 +31,6 @@ def _load_default_configs():
         _load_yaml(CONFIG_DIR / "reward_default.yaml"),
         _load_yaml(CONFIG_DIR / "train_default.yaml"),
     )
-
-
-def _evaluate(env, agent, seeds):
-    outcomes = {"win": 0, "loss": 0, "timeout": 0}
-    total_reward = 0.0
-    for seed in seeds:
-        obs, info = env.reset(seed=seed)
-        terminated = truncated = False
-        while not (terminated or truncated):
-            action = agent.act(obs, global_step=0, greedy=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            total_reward += reward
-        outcomes[info["outcome"]] += 1
-    n = len(seeds)
-    return {
-        "avg_reward": total_reward / n,
-        "win_rate": outcomes["win"] / n,
-        "loss_rate": outcomes["loss"] / n,
-        "timeout_rate": outcomes["timeout"] / n,
-    }
 
 
 def train(run_name="dqn_v1", env_config=None, reward_config=None, train_config=None):
@@ -160,8 +141,11 @@ def train(run_name="dqn_v1", env_config=None, reward_config=None, train_config=N
                 logger.info("Saved checkpoint at episode %d", episode)
 
             if episode % eval_interval_episodes == 0:
-                eval_stats = _evaluate(eval_env, agent, eval_seeds)
+                eval_stats = rollout(
+                    eval_env, lambda obs: agent.act(obs, global_step=0, greedy=True), eval_seeds
+                )
                 logger.info("Eval at episode %d: %s", episode, eval_stats)
+                append_eval_log_row(run_dir, checkpoint_step=global_step, stats=eval_stats)
                 writer.add_scalar("eval/win_rate", eval_stats["win_rate"], episode)
                 writer.add_scalar("eval/avg_reward", eval_stats["avg_reward"], episode)
                 if eval_stats["win_rate"] > best_win_rate:

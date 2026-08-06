@@ -157,7 +157,12 @@ class CombatEnv(gym.Env):
         )
 
         obs = self._get_obs()
-        info = {"outcome": outcome, "soldier_hit": soldier_hit, "enemy_hit": enemy_hit}
+        info = {
+            "outcome": outcome,
+            "soldier_hit": soldier_hit,
+            "enemy_hit": enemy_hit,
+            "soldier_empty_gun_fire": empty_gun_fire,
+        }
         truncated = False
         return obs, reward, terminated, truncated, info
 
