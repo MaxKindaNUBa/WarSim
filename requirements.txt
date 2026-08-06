@@ -1,0 +1,10 @@
+gymnasium
+numpy
+pyyaml
+tensorboard
+pygame
+matplotlib
+pytest
+# torch (CUDA build) installed separately, e.g.:
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch
