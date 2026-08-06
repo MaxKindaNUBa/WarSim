@@ -85,6 +85,7 @@ class CombatEnv(gym.Env):
         self.soldier = None
         self.enemy = None
         self.t = 0
+        self.last_hit_events = []
 
     # -- Gymnasium API -----------------------------------------------------
 
@@ -112,6 +113,7 @@ class CombatEnv(gym.Env):
         }
         self._update_enemy_orientation()
         self.t = 0
+        self.last_hit_events = []  # [(shooter_pos, target_pos), ...] for the renderer's on-hit tracer
 
         obs = self._get_obs()
         info = {}
@@ -131,6 +133,12 @@ class CombatEnv(gym.Env):
             self._resolve_soldier_fire(fire)
         )
         enemy_hit, enemy_damage, _, _ = self._resolve_enemy_fire()
+
+        self.last_hit_events = []
+        if soldier_hit:
+            self.last_hit_events.append((tuple(self.soldier["position"]), tuple(self.enemy["position"])))
+        if enemy_hit:
+            self.last_hit_events.append((tuple(self.enemy["position"]), tuple(self.soldier["position"])))
 
         self.enemy["hp"] = max(0.0, self.enemy["hp"] - soldier_damage)
         self.soldier["hp"] = max(0.0, self.soldier["hp"] - enemy_damage)

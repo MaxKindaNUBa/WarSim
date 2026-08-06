@@ -1,0 +1,21 @@
+[project]
+name = "dqn-combat-sim"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "gymnasium",
+    "numpy",
+    "pyyaml",
+    "tensorboard",
+    "pygame",
+    "matplotlib",
+    "pytest",
+    "torch",
+]
+
+[tool.setuptools]
+packages = ["envs", "agents", "training", "rendering", "logging_utils"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
