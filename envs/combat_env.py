@@ -1,4 +1,27 @@
-"""CombatEnv(gym.Env) — reset/step/observation for the 1v1 combat simulation."""
+"""CombatEnv(gym.Env): a 1v1 top-down combat simulation — one learning "soldier"
+against a scripted "enemy" on a rectangular map.
+
+Each tick the soldier picks one of N_MOVE_DIRECTIONS * N_FIRE_STATES * n_bins
+discrete actions (move direction, fire or not, and the orientation bin to face),
+moves, optionally fires, and the scripted enemy turns to face the soldier's true
+bearing and fires back if enemy_fire_enabled. Line-of-sight is exact-bin
+matching (ballistics.check_los): a shot only has a chance to hit if the
+shooter's orientation bin equals the target's true-bearing bin. Hit chance and
+damage are both range-interpolated lookup tables (env_config["gun"]).
+
+The enemy's toughness is tunable independently of its base stats via
+set_enemy_difficulty() (reaction_interval_steps / fire_cooldown_steps /
+fire_enabled) — this is what training/train.py's curriculum ramps up over the
+course of a run, from "can't shoot back" to full difficulty.
+
+Config is split across two YAML sections, loaded from config/ by default:
+env_config (config/sim_default.yaml's env:) controls map/gun/HP/movement, and
+reward_config (config/training_default.yaml's reward:) controls reward shaping
+(see _get_reward). Either can be overridden by passing an already-loaded dict.
+
+Episodes end in "win" (enemy HP -> 0, including a simultaneous double-kill),
+"loss" (soldier HP -> 0), or "timeout" (max_timesteps reached with both alive).
+"""
 import math
 from pathlib import Path
 
@@ -32,20 +55,34 @@ def _load_yaml(path):
         return yaml.safe_load(f)
 
 
+def _load_sim_defaults():
+    return _load_yaml(_CONFIG_DIR / "sim_default.yaml")
+
+
+def _load_training_defaults():
+    return _load_yaml(_CONFIG_DIR / "training_default.yaml")
+
+
 class CombatEnv(gym.Env):
     metadata = {"render_modes": [None, "human"]}
 
-    def __init__(self, env_config=None, reward_config=None, render_mode=None,
-                 enemy_fire_enabled=True):
+    def __init__(self, env_config=None, reward_config=None, render_config=None, render_mode=None,
+                 enemy_fire_enabled=True, enemy_reaction_interval_steps=1, enemy_fire_cooldown_steps=None):
         super().__init__()
 
         if env_config is None:
-            env_config = _load_yaml(_CONFIG_DIR / "env_default.yaml")
+            env_config = _load_sim_defaults()["env"]
         if reward_config is None:
-            reward_config = _load_yaml(_CONFIG_DIR / "reward_default.yaml")
+            reward_config = _load_training_defaults()["reward"]
 
         self.render_mode = render_mode
+        self.render_config = render_config  # lazily defaulted in render(); headless envs never touch this
         self.enemy_fire_enabled = bool(enemy_fire_enabled)
+        # Curriculum knobs (see set_enemy_difficulty and train.curriculum in
+        # config/training_default.yaml) — default to instant, full-cooldown enemy tracking,
+        # i.e. exactly today's behavior, so nothing else that builds a CombatEnv needs to change.
+        self.enemy_reaction_interval_steps = int(enemy_reaction_interval_steps)
+        self._enemy_reaction_counter = 0
 
         self.map_width = float(env_config["map"]["width"])
         self.map_height = float(env_config["map"]["height"])
@@ -63,14 +100,23 @@ class CombatEnv(gym.Env):
         self.accuracy_table = gun["accuracy_table"]
         self.damage_table = gun["damage_table"]
 
+        # Enemy's own cooldown, independently curriculum-able — defaults to the soldier's
+        # fire_cooldown_steps (today's behavior: both sides share one cooldown) unless overridden.
+        self.enemy_fire_cooldown_steps = (
+            int(enemy_fire_cooldown_steps) if enemy_fire_cooldown_steps is not None else self.fire_cooldown_steps
+        )
+
         self.soldier_max_hp = float(env_config["soldier"]["max_hp"])
         self.enemy_max_hp = float(env_config["enemy"]["max_hp"])
 
         self.step_penalty = float(reward_config["step_penalty"])
         self.hit_reward_scale = float(reward_config["hit_reward_scale"])
         self.damage_taken_penalty_scale = float(reward_config["damage_taken_penalty_scale"])
-        self.empty_gun_fire_penalty = float(reward_config["empty_gun_fire_penalty"])
-        self.orientation_shaping_bonus_weight = float(reward_config["orientation_shaping_bonus_weight"])
+        self.ammo_depleted_penalty = float(reward_config["ammo_depleted_penalty"])
+        self.facing_enemy_reward = float(reward_config["facing_enemy_reward"])
+        self.fire_while_facing_bonus = float(reward_config["fire_while_facing_bonus"])
+        self.fire_while_not_facing_penalty = float(reward_config["fire_while_not_facing_penalty"])
+        self.distance_closing_reward_scale = float(reward_config["distance_closing_reward_scale"])
         self.terminal_win = float(reward_config["terminal"]["win"])
         self.terminal_lose = float(reward_config["terminal"]["lose"])
         self.terminal_timeout = float(reward_config["terminal"]["timeout"])
@@ -111,7 +157,10 @@ class CombatEnv(gym.Env):
             "ammo": int(self.max_ammo),
             "cooldown_remaining": 0,
         }
-        self._update_enemy_orientation()
+        # Bypasses the reaction-interval gate: the enemy always starts an episode correctly
+        # oriented (fair), the curriculum lag only kicks in from the first step() onward.
+        self.enemy["orientation_bin"] = self._true_enemy_orientation_bin()
+        self._enemy_reaction_counter = 0
         self.t = 0
         self.last_hit_events = []  # [(shooter_pos, target_pos), ...] for the renderer's on-hit tracer
 
@@ -125,13 +174,17 @@ class CombatEnv(gym.Env):
         self.soldier["cooldown_remaining"] = max(0, self.soldier["cooldown_remaining"] - 1)
         self.enemy["cooldown_remaining"] = max(0, self.enemy["cooldown_remaining"] - 1)
 
+        prev_distance = geometry.distance(self.soldier["position"], self.enemy["position"])
         self.soldier["orientation_bin"] = orientation_bin
         self._move_soldier(move_dir)
+        distance_closed = prev_distance - geometry.distance(self.soldier["position"], self.enemy["position"])
         self._update_enemy_orientation()
 
+        soldier_ammo_before = self.soldier["ammo"]
         soldier_hit, soldier_damage, soldier_ammo_consumed, soldier_fire_executed = (
             self._resolve_soldier_fire(fire)
         )
+        ammo_just_depleted = soldier_ammo_before > 0 and self.soldier["ammo"] == 0
         enemy_hit, enemy_damage, _, _ = self._resolve_enemy_fire()
 
         self.last_hit_events = []
@@ -148,11 +201,16 @@ class CombatEnv(gym.Env):
         terminated, outcome = self._check_terminated()
 
         empty_gun_fire = soldier_fire_executed and not soldier_ammo_consumed
+        real_fire_attempt = soldier_fire_executed and soldier_ammo_consumed
+        facing_enemy = self._soldier_facing_enemy()
         reward = self._get_reward(
             soldier_damage_dealt=soldier_damage,
             enemy_damage_taken=enemy_damage,
-            empty_gun_fire=empty_gun_fire,
-            soldier_facing_enemy=self._soldier_facing_enemy(),
+            ammo_just_depleted=ammo_just_depleted,
+            facing_enemy=facing_enemy,
+            fired_while_facing_enemy=real_fire_attempt and facing_enemy,
+            fired_while_not_facing_enemy=real_fire_attempt and not facing_enemy,
+            distance_closed=distance_closed,
             outcome=outcome,
         )
 
@@ -170,7 +228,10 @@ class CombatEnv(gym.Env):
         if self.render_mode != "human":
             return None
         from rendering import pygame_renderer
-        return pygame_renderer.render(self)
+        render_config = self.render_config
+        if render_config is None:
+            render_config = _load_sim_defaults()["render"]
+        return pygame_renderer.render(self, render_config)
 
     def close(self):
         if self.render_mode == "human":
@@ -196,9 +257,32 @@ class CombatEnv(gym.Env):
         new_y = float(np.clip(self.soldier["position"][1] + dy * self.move_step_size, 0.0, self.map_height))
         self.soldier["position"] = np.array([new_x, new_y], dtype=np.float64)
 
-    def _update_enemy_orientation(self):
+    def _true_enemy_orientation_bin(self):
         bearing = geometry.bearing(self.enemy["position"], self.soldier["position"])
-        self.enemy["orientation_bin"] = geometry.angle_to_bin(bearing, self.bin_size_degrees)
+        return geometry.angle_to_bin(bearing, self.bin_size_degrees)
+
+    def _update_enemy_orientation(self):
+        # Curriculum reaction lag: the enemy only re-acquires the soldier's true bearing once
+        # every enemy_reaction_interval_steps ticks, holding its last orientation in between.
+        # Since the soldier keeps moving, a stale orientation often fails the exact-bin
+        # check_los match on its own — a sluggish enemy whiffs from bad tracking, not a
+        # weakened accuracy roll. interval_steps=1 (default) updates every tick, i.e. today's
+        # instant-tracking behavior, unchanged.
+        self._enemy_reaction_counter += 1
+        if self._enemy_reaction_counter < self.enemy_reaction_interval_steps:
+            return
+        self._enemy_reaction_counter = 0
+        self.enemy["orientation_bin"] = self._true_enemy_orientation_bin()
+
+    def set_enemy_difficulty(self, reaction_interval_steps=None, fire_cooldown_steps=None, fire_enabled=None):
+        """Advance (or otherwise change) the curriculum mid-run without rebuilding the env —
+        see train.curriculum in config/training_default.yaml and training/train.py."""
+        if reaction_interval_steps is not None:
+            self.enemy_reaction_interval_steps = int(reaction_interval_steps)
+        if fire_cooldown_steps is not None:
+            self.enemy_fire_cooldown_steps = int(fire_cooldown_steps)
+        if fire_enabled is not None:
+            self.enemy_fire_enabled = bool(fire_enabled)
 
     def _soldier_facing_enemy(self):
         bearing = geometry.bearing(self.soldier["position"], self.enemy["position"])
@@ -235,7 +319,7 @@ class CombatEnv(gym.Env):
         )
         if ammo_consumed:
             self.enemy["ammo"] -= 1
-            self.enemy["cooldown_remaining"] = self.fire_cooldown_steps
+            self.enemy["cooldown_remaining"] = self.enemy_fire_cooldown_steps
         return hit, damage, ammo_consumed, True
 
     def _check_terminated(self):
@@ -248,15 +332,24 @@ class CombatEnv(gym.Env):
             return True, "timeout"
         return False, None
 
-    def _get_reward(self, soldier_damage_dealt, enemy_damage_taken, empty_gun_fire,
-                     soldier_facing_enemy, outcome):
+    def _get_reward(self, soldier_damage_dealt, enemy_damage_taken, ammo_just_depleted, facing_enemy,
+                     fired_while_facing_enemy, fired_while_not_facing_enemy, distance_closed, outcome):
         reward = self.step_penalty
         reward += self.hit_reward_scale * soldier_damage_dealt
         reward -= self.damage_taken_penalty_scale * enemy_damage_taken
-        if empty_gun_fire:
-            reward += self.empty_gun_fire_penalty
-        if soldier_facing_enemy:
-            reward += self.orientation_shaping_bonus_weight
+        if ammo_just_depleted:
+            reward += self.ammo_depleted_penalty
+        if facing_enemy:
+            reward += self.facing_enemy_reward
+        if fired_while_facing_enemy:
+            reward += self.fire_while_facing_bonus
+        if fired_while_not_facing_enemy:
+            reward += self.fire_while_not_facing_penalty
+        # Signed: positive when the soldier's move this tick reduced distance to the enemy,
+        # negative when it increased it. Telescopes to scale * (initial_dist - final_dist)
+        # over a whole episode, so oscillating back and forth nets ~0 — it can't be farmed,
+        # only net progress toward (or away from) the enemy is rewarded.
+        reward += self.distance_closing_reward_scale * distance_closed
         if outcome == "win":
             reward += self.terminal_win
         elif outcome == "loss":

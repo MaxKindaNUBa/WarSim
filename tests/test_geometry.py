@@ -1,3 +1,6 @@
+"""Unit tests for envs/geometry.py: distance, bearing, and the angle<->orientation-bin
+conversions, including wraparound at 0/360 degrees and half-open bin edges.
+"""
 import pytest
 
 from envs import geometry

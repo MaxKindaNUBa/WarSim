@@ -1,4 +1,8 @@
-"""Randomized spawn logic for CombatEnv resets."""
+"""Randomized spawn logic for CombatEnv.reset(): rejection-samples soldier/enemy
+positions uniformly within the map until they're at least min_separation apart,
+and samples the soldier's starting orientation bin uniformly. Takes CombatEnv's
+seeded self.np_random so spawns stay reproducible per-episode-seed.
+"""
 import numpy as np
 
 

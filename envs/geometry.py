@@ -1,4 +1,10 @@
-"""Bearing/distance/binning math for the combat environment."""
+"""Pure math helpers shared by CombatEnv and its agents: euclidean distance,
+compass bearing (0-360 degrees, atan2-based), and conversion between a
+continuous bearing and a discrete orientation bin (half-open bins
+[i*bin_size, (i+1)*bin_size), wrapping at 360). No env/agent state — every
+function here takes plain positions/angles and is independently unit-tested
+in tests/test_geometry.py.
+"""
 import math
 
 

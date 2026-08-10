@@ -1,0 +1,207 @@
+# Reward shaping, DQN training hyperparameters, and standalone evaluation config.
+# See sim_default.yaml for env/agent/render.
+#
+# --reward-config / --train-config / --eval-config CLI flags still take a standalone file
+# matching just that section's schema (flat, not nested under reward:/train:/eval:).
+
+# reward = step_penalty + hit_reward_scale*damage_dealt - damage_taken_penalty_scale*damage_taken
+#        + ammo_depleted_penalty (once, the tick ammo hits 0)
+#        + facing_enemy_reward (dense, every tick, facing the enemy's true bearing bin)
+#        + fire_while_facing_bonus / fire_while_not_facing_penalty (real fire attempts only)
+#        + distance_closing_reward_scale * (distance closed this tick, signed)
+#        + terminal.{win,lose,timeout}
+reward:
+  hit_reward_scale: 5.0             # x damage dealt on a landed hit
+  damage_taken_penalty_scale: 1.5   # x damage received
+
+  step_penalty: -0.03               # flat, every tick
+
+  terminal:
+    win: 300.0                      # enemy HP -> 0 (simultaneous kill also counts as win)
+    lose: -50.0                    # soldier HP -> 0
+    timeout: -70.0                  # max_timesteps reached, both alive
+
+  # One-time, paid the instant the soldier's ammo hits 0 (not repeated on every subsequent
+  # empty-fire attempt like the old empty_gun_fire_penalty was). A single big hit for
+  # dumping the whole mag is a much stronger signal to conserve ammo/make shots count than
+  # a small per-attempt penalty that never actually stopped it from firing into an empty gun.
+  ammo_depleted_penalty: -30.0      # paid once, the tick ammo reaches 0
+
+  # Dense per-tick signal for orientation, independent of firing. Deliberately kept smaller
+  # in magnitude than step_penalty so facing-without-firing is still net negative every tick
+  # (just less negative than not facing) — gives a gradient toward tracking the enemy without
+  # ever being profitable to camp on its own. A full-size version of this used to create a
+  # "look but never shoot" local optimum; this is capped specifically to avoid that.
+  facing_enemy_reward: 0.01             # facing the enemy's true bearing bin, every tick
+
+  # Real fire attempts only (ammo available, off cooldown) — never for passively facing
+  # without firing, which used to create a "look but never shoot" local optimum.
+  fire_while_facing_bonus: 0.5          # fired while facing the enemy's true bearing bin
+  fire_while_not_facing_penalty: -0.5   # fired while not facing it (guaranteed miss)
+
+  # Signed & symmetric: scale * (distance_before - distance_after). Telescopes to net
+  # progress over the episode (can't be farmed by oscillating); ~0 once range is held steady.
+  distance_closing_reward_scale: 0.05
+
+# DQN hyperparameters. train.py uses all of this; evaluate.py/watch_policy.py only need
+# network/optim/target_network/epsilon to rebuild a matching DQNAgent from a checkpoint.
+# IMPORTANT: network.hidden_layers/activation must match whatever a loaded checkpoint used.
+train:
+  seed: 43
+  device: cuda                      # informational; DQNAgent hard-fails if CUDA isn't available
+  enemy_fire_enabled: true         # scripted enemy shoots back during training
+
+  # Enemy-difficulty curriculum (envs/combat_env.py: enemy_reaction_interval_steps /
+  # enemy_fire_cooldown_steps / enemy_fire_enabled / set_enemy_difficulty). enemy_fire=True
+  # runs never learned to win (see runs/ comparison: enemy_fire=False hit 100% win_rate,
+  # enemy_fire=True never beat 2%) — the enemy's zero-lag perfect tracking punishes engagement
+  # before the agent can ever practice aiming well enough to win.
+  #
+  # The reaction-lag "sluggish" mechanic alone (stages 1-3 below) turned out NOT to be enough
+  # of a stage-0 substitute for enemy_fire=False on its own (dqn_v3_PER_curriculum run: stuck
+  # at stage 0/3 for the full 500k steps, curriculum-check win_rate never sustained above
+  # ~0.23) — the enemy is a stationary turret, so on a straight-line approach (the most
+  # natural way to close distance) the true bearing barely changes, and a "sluggish" enemy
+  # that locked on N ticks ago is still just as correctly aimed as an instant-tracking one.
+  # Reaction lag only actually helps against lateral/circling movement. So stage 0 is now
+  # literally enemy_fire_enabled: false — zero risk during initial aim-mastery, matching the
+  # one config we've empirically proven this pipeline can solve — and fire only turns on
+  # (starting sluggish, via the same mechanism) from stage 1 onward.
+  #
+  # Steps toward full difficulty (stage 4, matching gun.fire_cooldown_steps below) only once
+  # win_rate against the *current* stage has converged — see the curriculum-check eval in
+  # training/train.py, separate from the standard eval_log.csv eval (always full difficulty,
+  # for one consistent metric across the whole run).
+  curriculum:
+    enabled: true
+    win_rate_threshold: 0.7     # avg win_rate (curriculum-check eval) needed to advance a stage
+    convergence_window: 4       # ...averaged over this many consecutive curriculum-check evals
+    stages:
+      - enemy_fire_enabled: false      # stage 0: no counter-fire at all — pure aim/engagement practice
+        reaction_interval_steps: 1     # moot while fire is off; set to the eventual stage-1 value
+        fire_cooldown_steps: 18
+      - enemy_fire_enabled: true       # stage 1: fire turns on, still very sluggish
+        reaction_interval_steps: 12    # re-aims roughly once every 6s of sim time
+        fire_cooldown_steps: 18
+      - enemy_fire_enabled: true
+        reaction_interval_steps: 9
+        fire_cooldown_steps: 13
+      - enemy_fire_enabled: true
+        reaction_interval_steps: 6
+        fire_cooldown_steps: 10
+      - enemy_fire_enabled: true
+        reaction_interval_steps: 3
+        fire_cooldown_steps: 5
+      - enemy_fire_enabled: true       # stage 5: full difficulty, matches gun.fire_cooldown_steps (3) below
+        reaction_interval_steps: 1
+        fire_cooldown_steps: 3
+
+    # Re-injects exploration on every stage advance (agents/dqn.py: DQNAgent.bump_epsilon).
+    # Without this, epsilon has usually already decayed near its floor by the time curriculum
+    # advances, so a policy that's gone mostly-greedy against the old (easier) dynamics has
+    # little pressure to go re-discover what changed at the new stage — it just keeps
+    # confidently repeating behavior that was safe before.
+    #
+    # No separate decay rate here on purpose: a bump only raises epsilon on top of the existing
+    # epsilon.decay_steps schedule, it doesn't get its own. An earlier version let it override
+    # the decay rate too, which backfired — bumping early in training (while the original decay
+    # still had most of its budget left) replaced that remaining budget with a much shorter
+    # window, so epsilon hit its floor far sooner than the un-bumped schedule would have,
+    # net-reducing total exploration instead of adding to it (see dqn_v3_PER_curriculum
+    # 20260807_222519 vs 20260807_154514: worse full-difficulty eval win_rate at matching steps).
+    # It's a no-op if the natural (un-bumped) epsilon is already >= value — a bump can only add
+    # exploration, never remove it.
+    epsilon_bump:
+      enabled: true
+      value: 0.25   # epsilon jumps to this on every stage advance (null -> epsilon.start, full reset)
+
+  network:
+    hidden_layers: [256, 256, 256]
+    activation: relu                # relu | tanh | leaky_relu
+
+  replay_buffer:
+    capacity: 200_000
+    batch_size: 128
+    min_size_before_training: 100_000   # buffer must reach this size before train_step() starts
+
+    # Proportional PER (agents/replay_buffer.py:PrioritizedReplayBuffer), reference
+    # implementation in PA2_RLbonus.ipynb. Samples transitions with probability
+    # p_i^alpha / sum(p_j^alpha) instead of uniformly, so rare-but-important transitions
+    # (e.g. one of the few wins so far) get replayed more than their 1-in-thousands share.
+    per:
+      alpha: 0.4               # 0 = uniform sampling (no prioritization), 1 = fully greedy on TD error
+      beta_start: 0.4          # importance-sampling correction strength at step 0
+      beta_end: 1.0             # ...anneals up to fully-corrected by beta_decay_steps
+      beta_decay_steps: 400_000 # matches num_steps_total below: beta reaches 1.0 by the run's end
+      priority_epsilon: 1.0e-6  # added to |TD error| so zero-error transitions still get sampled sometimes
+
+    # Periodic replay-buffer top-up with fresh HeuristicAgent (agents/heuristic_agent.py)
+    # rollouts, so heuristic-quality "how to aim and engage" transitions stay present in the
+    # buffer throughout training. A one-time seed at the start gets evicted by the circular
+    # buffer (FIFO) after roughly one capacity's worth of self-play steps and is forgotten —
+    # this re-seeds every interval_steps instead. Uses agent.heuristic.preferred_range from
+    # sim_default.yaml. Seeds march forward each top-up (seed_base, seed_base +
+    # episodes_per_topup, ...) so every top-up is fresh episodes, never a repeat; kept clear
+    # of eval.seed_base (500_000) and train.checkpoint.eval_seed_base (900_000) below.
+    buffer_seeding:
+      enabled: false
+      interval_steps: 40_000    # how often (env steps) to roll out fresh heuristic episodes and push them in
+      episodes_per_topup: 40    # heuristic episodes pushed to the buffer per top-up
+      seed_base: 700_000        # first seed; advances by episodes_per_topup on every top-up
+
+  optim:
+    learning_rate: 0.0002
+    gamma: 0.99                     # discount factor
+    optimizer_type: adam            # adam | sgd | rmsprop
+    weight_decay: 0.0
+    eps: 1.0e-8                     # adam/rmsprop only
+    momentum: 0.9                   # sgd/rmsprop only
+    grad_clip_norm: 10.0             # max grad L2 norm per train_step(); null = off. Caps how much any single
+                                     # batch (e.g. one containing a rare +100 win) can shift the weights.
+    loss_fn: smooth_l1              # smooth_l1 | mse
+
+    # Linear decay of the optimizer's LR over training (agents/dqn.py: DQNAgent.lr_at,
+    # applied every train_step()). Standard fix for late-training value drift in DQN — a
+    # constant LR keeps taking full-size gradient steps long after the useful learning has
+    # happened, letting an already-good policy wander (see dqn_v3_PER_curriculum: win_rate
+    # peaked at 0.49 around step 690k then drifted down to ~0.2 by step 930k, well after
+    # epsilon had already floored out, so exploration noise wasn't the cause).
+    #
+    # Units are train_step() COUNT (gradient updates), not env steps — given
+    # train_every_n_steps below, N env steps ~= N / train_every_n_steps gradient updates.
+    lr_decay:
+      enabled: true
+      end_learning_rate: 0.00002   # floor the LR decays toward (10x below the start rate)
+      decay_steps: 200_000          # in train_step() calls, not env steps -- see note above
+
+  target_network:
+    update_mode: polyak             # polyak | hard. polyak = smooth every-step blend (less prone to the
+                                     # abrupt policy shifts a hard sync can cause); hard = periodic exact copy
+    tau: 0.002                      # polyak only: target <- tau*online + (1-tau)*target, applied every train_step()
+    sync_interval_steps: 1_000       # hard only: exact online -> target copy every N train_step() calls
+
+  epsilon:
+    start: 1.0
+    end: 0.01
+    decay_steps: 300_000          # linear decay length, in env steps
+
+  train_every_n_steps: 4            # env steps per train_step() call
+
+  log_interval_steps: 5_000        # cadence (env steps) for tensorboard scalars + the
+                                     # episode-summary line printed to terminal/run.log
+
+  num_steps_total: 1_000_000        # total env steps before stopping (current episode always
+                                     # finishes first, so this can overshoot slightly)
+
+  checkpoint:
+    interval_steps: 100_000       # save checkpoint_step<N>.pt every N env steps
+    eval_interval_steps: 10_000     # run an in-training eval rollout every N env steps
+    eval_episodes: 100               # episodes per in-training eval rollout
+    eval_seed_base: 900_000         # first seed for in-training eval (kept clear of eval.seed_base below)
+
+# Standalone evaluate.py --checkpoint comparison (vs random/heuristic baselines). Separate
+# from train.checkpoint.eval_* above, which controls in-training eval instead.
+eval:
+  n_episodes: 200            # episodes per policy, fixed-seed
+  seed_base: 500_000         # first seed; same seeds used for all 3 policies
+  enemy_fire_enabled: true   # independent of whatever the checkpoint trained with

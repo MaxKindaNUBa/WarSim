@@ -1,3 +1,6 @@
+"""Unit tests for envs/ballistics.py: accuracy/damage table interpolation, the
+exact-bin line-of-sight check, and resolve_shot()'s ammo/LOS/hit-roll gating.
+"""
 import numpy as np
 import pytest
 

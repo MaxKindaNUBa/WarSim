@@ -4,6 +4,8 @@ pyyaml
 tensorboard
 pygame
 matplotlib
+pandas
+scipy
 pytest
 # torch (CUDA build) installed separately, e.g.:
 # pip install torch --index-url https://download.pytorch.org/whl/cu121

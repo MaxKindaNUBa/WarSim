@@ -1,4 +1,5 @@
 runs/
+notebooks/
 .claude/
 __pycache__/
 *.pyc

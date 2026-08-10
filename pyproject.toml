@@ -9,6 +9,8 @@ dependencies = [
     "tensorboard",
     "pygame",
     "matplotlib",
+    "pandas",
+    "scipy",
     "pytest",
     "torch",
 ]
