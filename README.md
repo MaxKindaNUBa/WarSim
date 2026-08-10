@@ -14,7 +14,8 @@ from harmless to fully lethal via a difficulty curriculum — tries to do the sa
 
 ```
 envs/            CombatEnv (the Gymnasium env) and the pure-function physics it's built from
-  combat_env.py    reset()/step()/observation — the core simulation, see "The environment" below
+  combat_env.py    reset()/step()/observation — the core simulation, see "The simulation
+                   environment, in plain terms" below
   ballistics.py    accuracy/damage-by-range lookup tables, line-of-sight check, shot resolution
   geometry.py      distance, bearing, and continuous-angle <-> discrete-orientation-bin math
   spawner.py       randomized, separation-respecting start positions for reset()
@@ -49,6 +50,11 @@ runs/            training output, one folder per run (gitignored)
 view_results.py  standalone plotting tool for runs/ eval_log.csv data (see below)
 ```
 
+`environment_design_spec.md` — the original design spec the simulation was built from (soldier/
+enemy behavior, ballistics, action/observation space, reward — in narrative form). The
+"simulation environment" section below is the practical, up-to-date version of the same
+material, including a few places the implementation moved past that spec.
+
 `notebooks/` (a scratch/reference notebook, unrelated to the rest of the pipeline) is
 gitignored and not covered here.
 
@@ -65,51 +71,249 @@ CUDA version). `DQNAgent` refuses to run at all if `torch.cuda.is_available()` i
 raises immediately rather than silently falling back to CPU, since this project trains on a
 CUDA GPU by design.
 
-## The environment
+## The simulation environment, in plain terms
 
-`CombatEnv` (`envs/combat_env.py`) is a `gymnasium.Env` with a flat discrete action space and
-a flat continuous (`Box`) observation space — no image/grid input.
+### The premise
 
-**Action space** — one integer encoding three independent choices per tick:
-- **move direction**: stay, or one of 8 compass directions (normalized to a fixed step size,
-  so diagonals move the same distance per tick as cardinals)
-- **fire**: yes/no
-- **orientation bin**: which of `n_bins = 360 / bin_size_degrees` discrete headings to face
-  this tick (orientation is a direct action, not something that turns gradually)
+Every episode is a 1-on-1 shootout on a flat, featureless rectangular map — no obstacles, no
+cover, no terrain. Two combatants: a **soldier**, who is the one thing being trained (every
+action it takes is chosen by the DQN policy), and an **enemy**, a fixed, non-learning scripted
+opponent. The soldier has to close to an effective range, keep its weapon aimed at the enemy,
+and land shots before it runs out of time, health, or ammo — while the enemy does the same back
+under a scripted (not learned) targeting routine. There's no story or visual complexity beyond
+that; the whole "game" reduces to positions, facing direction, health, and ammo, plus math
+derived from those.
 
-`action_space = Discrete(9 * 2 * n_bins)` — 180 actions at the default `bin_size_degrees: 36`
-(`n_bins = 10`).
+An episode ends the instant one side's HP hits zero, or after a fixed number of ticks with
+both still alive (see "How an episode ends" below).
 
-**Observation space** — a `Box` of `12 + 2*n_bins` floats (32-dim at the default bin size):
-relative position to the enemy (dx, dy); the soldier's own ammo, max weapon range, fire
-cooldown remaining, and accuracy-at-current-range; the same four fields mirrored for the
-enemy; both units' current HP; and each unit's orientation as a one-hot vector over `n_bins`.
+### The world and the passage of time
 
-**Line of sight and shot resolution** (`envs/ballistics.py`) — LOS is exact-bin matching: a
-shot only has a chance to hit if the shooter's orientation bin equals the target's *true*
-bearing bin (`check_los`). If LOS holds, hit probability and damage are both independently
-range-interpolated from lookup tables (`gun.accuracy_table` / `gun.damage_table` in
-`sim_default.yaml`, `np.interp` under the hood — clamped at the table's ends). Firing consumes
-one round of ammo and starts a cooldown regardless of whether the shot has LOS; firing with 0
-ammo is a no-op ("empty gun fire") that doesn't start a cooldown.
+The map is a flat plane with a fixed width/height (`env.map.width` / `height` in
+`sim_default.yaml`, default 100x100 map units) — bounded only so movement/rendering stay
+cheap and predictable, not because the boundary is part of the tactical problem (everything
+either combatant observes is relative distance/bearing, never absolute map position). Neither
+combatant can walk outside it.
 
-**The enemy** turns to face the soldier's *true* bearing and fires back under the same
-ballistics rules, but its reaction speed, fire rate, and whether it fires at all are all
-runtime-tunable via `CombatEnv.set_enemy_difficulty()` — this is the hook `training/train.py`'s
-curriculum uses to make the enemy progressively harder over the course of a run (see "Training
-curriculum" below) without rebuilding the environment.
+Time moves in fixed discrete **ticks**, not continuous physics: each `step()` call is one tick
+— one movement update, one orientation update, and up to one fire attempt per side, all
+resolved together. Each tick nominally represents `env.timestep_duration_s` seconds of
+simulated time (default 0.5s), but that only matters for the GUI viewer
+(`training/watch_policy.py`), which sleeps between ticks to match real time. Headless training
+and evaluation runs have **no throttling at all** — they tick forward as fast as the CPU can
+compute, completely decoupled from `timestep_duration_s`.
 
-**Reward** (`_get_reward` in `combat_env.py`, weights in `training_default.yaml`'s `reward:`)
-is a sum of: a flat per-tick step penalty; scaled damage dealt / damage taken; a one-time
-penalty the tick ammo hits zero; a small dense reward for facing the enemy's true bearing
-every tick (deliberately capped below the step penalty so passively "looking but never
-shooting" is still net-negative); a bonus/penalty for firing while facing/not-facing the enemy;
-a signed distance-closing term (telescopes to net progress over an episode, so oscillating back
-and forth nets ~0 — it can't be farmed); and terminal win/lose/timeout bonuses.
+### The soldier (the learning agent)
 
-**Episode ends** in `"win"` (enemy HP hits 0 — a simultaneous double-kill also counts as a
-win), `"loss"` (soldier HP hits 0), or `"timeout"` (`episode.max_timesteps` reached with both
-sides alive).
+The soldier is the only entity anything is "learning" for — everything else in the simulation
+exists to give it something to overcome. Each tick, the DQN policy picks one action that bundles
+three independent decisions together (see "Action space" below): where to move, which way to
+face, and whether to fire.
+
+- **Movement**: one of 8 compass directions, or stand still, each tick. A chosen direction
+  always covers the same fixed distance (`env.movement.step_size`, default `2.0` map units) —
+  no momentum, no acceleration, and diagonal moves aren't any faster than cardinal ones (the
+  direction vector is normalized before being applied). Movement is clipped at the map edges.
+  Crucially, **movement and aiming are decoupled** — the soldier can walk northeast while
+  facing west; picking a movement direction never changes which way its weapon points.
+- **Orientation (aiming)**: a separate choice each tick, from a fixed number of discrete
+  "orientation bins" that divide the full 360° circle into equal wedges
+  (`env.bin_size_degrees`, default `36°` per bin → 10 bins). Wherever the soldier is currently
+  oriented is where it will fire if it chooses to fire that tick — there's no separate aim vs.
+  facing concept, and no gradual turning; a chosen orientation takes effect immediately.
+- **The gun**: fixed ammo per episode (`env.gun.max_ammo`, default `20`) with no reload — once
+  it's empty, firing is still a *legal* action, it just can't do anything. A max effective
+  range (`env.gun.max_range`) beyond which shots can never land. A cooldown
+  (`env.gun.fire_cooldown_steps`) that must fully count down between shots. And two independent
+  range-dependent lookup curves — hit probability (`accuracy_table`) and damage-per-hit
+  (`damage_table`) — both of which get *worse* the farther away the target is (see "Ballistics"
+  below for exactly how they're used). These same mechanics apply symmetrically to the enemy's
+  weapon too.
+- **Firing is always legal, and never free.** Attempting to fire — even at zero ammo, even
+  facing the wrong way, even beyond max range — always consumes a round and starts the
+  cooldown if ammo is available; a "wasted" shot costs the same resource as an aimed one.
+  This is deliberate: it's what stops a trained policy from just spamming fire every tick
+  regardless of whether it's actually lined up, and it's why `evaluate.py` tracks
+  "empty gun fire attempts" as its own metric.
+- **HP**: depletes when the enemy lands a hit, by however much that hit's damage roll came out
+  to. Reaching 0 ends the episode as a loss.
+
+### The enemy (the scripted opponent)
+
+The enemy is not learning anything — its behavior is a fixed script, deliberately kept simple
+so the challenge in this environment comes from range/ammo/timing management against a
+*predictable* threat, not from an adaptive one.
+
+- **It never moves.** Its position is wherever it randomly spawned, for the whole episode.
+- **Its aim tracks the soldier.** Every tick it recomputes the true compass bearing from itself
+  to the soldier's *current* position and snaps its orientation to the nearest bin toward that
+  bearing. At full difficulty this is instant and perfect — no turning delay — which is why the
+  spawn point, not evasive maneuvering, is the main lever the soldier has over whether the
+  enemy is aimed at it.
+- **It fires automatically whenever it legally can** — soldier in range, cooldown expired — it
+  never "chooses" not to shoot the way a more sophisticated opponent might.
+- **Same weapon model as the soldier**: its own ammo/range/cooldown/accuracy/damage curves,
+  configured independently (`env.enemy` / the same `gun:` block — soldier and enemy currently
+  share one weapon config, but the ballistics code treats them symmetrically either way).
+- **Spawn**: randomized every episode, subject to a minimum-separation constraint from the
+  soldier's own randomized spawn point (`env.episode.min_spawn_separation`) so episodes never
+  start at point-blank range purely by chance.
+
+**Difficulty is tunable at runtime**, beyond what the original design spec called for: reaction
+speed, fire cooldown, and whether it fires *at all* can all be changed live via
+`CombatEnv.set_enemy_difficulty()`, without rebuilding the environment. This exists because a
+full-difficulty enemy turns out to be **unbeatable from a cold start** — an untrained policy
+essentially never wins against instant, perfect return fire, so it never gets to practice the
+aiming/engagement skills it would need to eventually win. `training/train.py`'s difficulty
+**curriculum** uses this hook to start the enemy harmless (or firing only sluggishly) and ramp
+it up in stages as the soldier's win rate against the *current* stage converges — see "Training
+curriculum" below for the full mechanism, and `training_default.yaml`'s `train.curriculum`
+comments for the empirical reasoning (including configurations that were tried and didn't
+work) behind exactly how it's staged.
+
+### Ballistics: how a fire attempt is actually resolved
+
+This one mechanism resolves *every* shot in the simulation — the soldier's and the enemy's
+alike, symmetrically, with no special-casing either direction. Given a fire attempt, in order:
+
+1. **Ammo check.** No ammo → the attempt does nothing (no hit, no damage) and doesn't start a
+   cooldown, since nothing was actually fired.
+2. **Line-of-sight gate.** The shooter's current orientation bin must exactly equal the
+   *target's true bearing bin* (i.e., the bin the target is actually standing in right now, not
+   an approximation). If it doesn't match, the shot **cannot hit, at all** — this is a hard
+   gate, not a probability penalty. It still consumes ammo and starts the cooldown, though —
+   firing while facing the wrong way is a real, wasted shot, not a free action.
+3. **Range check.** If the target is beyond the shooter's `max_range`, same result: guaranteed
+   miss, but ammo/cooldown are still spent.
+4. **Accuracy roll.** Only if LOS and range both pass: hit probability is read off the
+   shooter's accuracy-vs-distance table at the exact current distance (linearly interpolated
+   between the table's configured points, clamped beyond its ends), and a hit/miss is rolled
+   against that probability.
+5. **Damage.** If it hit, damage is read off a **second, independent** distance-vs-damage
+   table — not derived from the accuracy number at all. Both curves get worse with range, so a
+   close-in, correctly-aimed shot is both more likely to land and hits harder than the same
+   shot taken from farther away.
+
+Both combatants' shots are resolved through this exact process, independently, within the same
+`step()` call — neither one's shot outcome depends on or is aware of the other's that tick.
+
+### How an episode ends
+
+Every episode starts with both combatants at full HP/ammo, both positions randomized (subject
+to the minimum-separation rule above), and the soldier's starting orientation randomized too.
+From there, it ends the instant any one of these becomes true:
+
+- **Enemy HP reaches 0** → outcome `"win"`.
+- **Soldier HP reaches 0** → outcome `"loss"`.
+- **The tick count hits `env.episode.max_timesteps`** with both sides still alive → outcome
+  `"timeout"` — tracked as its own distinct outcome, not folded into a win or a loss, since a
+  cautious stalemate is a meaningfully different failure mode than actually dying.
+- **Special case — simultaneous double-kill**: if both HPs hit 0 on the very same tick (both
+  shots landing in the same `step()` call), it's scored as a **win**, not a draw. There's no
+  fourth "draw" outcome anywhere in this codebase; enemy-death is checked before soldier-death
+  specifically so this case falls out as a win. (This was an explicit design decision made
+  during implementation — the original design spec never addressed the simultaneous-death case.)
+
+### Action space (what the soldier's policy actually outputs)
+
+The DQN doesn't output "move" and "fire" and "aim" separately — Q-learning needs one flat list
+of discrete actions to take an `argmax` over, so all three decisions are packed into a single
+integer:
+
+| Component | Choices | Meaning |
+|---|---|---|
+| move direction | 9 | stay, or one of 8 compass directions |
+| fire | 2 | attempt to fire this tick, or don't |
+| orientation bin | `n_bins` (10 by default) | which way to face this tick |
+
+`action_space = Discrete(9 * 2 * n_bins)` — **180 total actions** at the default 10-bin
+setup. (The original design spec assumed 36 bins / 648 actions; the bin count was deliberately
+coarsened during implementation specifically to make the line-of-sight gate reachable by chance
+during early random exploration — a random action has a 1-in-10 shot at the correct orientation
+bin instead of 1-in-36, which matters a lot before the policy has learned anything about
+aiming. `env.bin_size_degrees` is a config value, so this is retunable without touching code —
+finer bins are a straightforward way to make aiming harder/more realistic later.)
+
+### Observation space (what the soldier's policy actually sees)
+
+Every tick, the policy's input is one flat vector of `12 + 2*n_bins` floats (**32-dim** at the
+default bin count) — no grid, no image, just numbers:
+
+| Field(s) | Count | What it is |
+|---|---|---|
+| `dx, dy` | 2 | the enemy's position **relative to the soldier** (never absolute map coordinates) |
+| soldier ammo, max range, cooldown remaining, accuracy-at-current-distance | 4 | the soldier's own weapon state — accuracy is handed over pre-computed from the lookup table, not left for the network to infer from raw distance |
+| enemy ammo, max range, cooldown remaining, accuracy-at-current-distance | 4 | the same four fields, mirrored for the enemy (the soldier is assumed to be able to read/estimate the enemy's weapon state) |
+| soldier HP, enemy HP | 2 | both units' current health |
+| soldier orientation | `n_bins` | one-hot vector over the orientation bins |
+| enemy orientation | `n_bins` | one-hot vector over the orientation bins |
+
+Orientation is one-hot encoded rather than a raw angle specifically so the network never has to
+learn circular wraparound on its own (that bin 9 is adjacent to bin 0, for instance) — as a
+one-hot vector, adjacency isn't something the network needs to discover, it's just there in
+the input.
+
+### Reward structure (what actually shapes the learned behavior)
+
+Every `step()` call returns one number (`_get_reward` in `combat_env.py`), which is just a sum
+of independent terms added together — nothing multiplicative, nothing conditional on more than
+one thing at once. At a glance, with the actual default weights from `training_default.yaml`'s
+`reward:` section filled in:
+
+```
+reward = -0.03                                   # step_penalty, every tick, flat
+        + 5.0   * damage_dealt_this_tick          # hit_reward_scale
+        - 1.5   * damage_taken_this_tick          # damage_taken_penalty_scale
+        + (-30.0 if ammo_just_hit_zero else 0)    # ammo_depleted_penalty, one-time
+        + (0.01 if facing_enemy else 0)           # facing_enemy_reward, every tick
+        + (0.5 if fired_while_facing else 0)      # fire_while_facing_bonus
+        + (-0.5 if fired_while_not_facing else 0) # fire_while_not_facing_penalty
+        + 0.05  * distance_closed_this_tick       # distance_closing_reward_scale, signed
+        + {win: +300.0, lose: -50.0, timeout: -70.0}[outcome]   # only on the terminal tick
+```
+
+Everything below the step penalty is zero most ticks — a typical mid-episode tick where the
+soldier moved a bit, was still cooling down, and wasn't facing the enemy yet is just
+`-0.03 + 0.05 * distance_closed`. The terminal outcome term only ever applies once, on the
+very last tick of an episode. The subsections below explain *why* each term looks the way it
+does — most of them exist because an earlier, simpler version of the reward created an
+unintended shortcut the policy learned to exploit instead of the intended behavior, and the
+current shape is what closed that loophole:
+
+- A small **flat penalty every tick**, just for time passing — discourages stalling.
+- **Damage dealt** (scaled up) and **damage taken** (scaled down, i.e. penalized) — the direct
+  "did something good/bad just happen" signal.
+- A **one-time penalty the instant ammo hits zero** — a single meaningful penalty for emptying
+  the mag, rather than a small penalty repeated on every subsequent empty-gun attempt (which
+  didn't actually discourage the behavior; see the comment in `training_default.yaml` for the
+  before/after reasoning).
+- A **small dense reward for facing the enemy's true bearing**, every tick, whether or not it
+  fires — deliberately kept smaller than the flat step penalty, so passively facing the enemy
+  without ever shooting is still net-negative overall (just less negative than facing away).
+  An earlier version of this bonus wasn't capped this way, and the policy learned to just stare
+  at the enemy and farm the reward without ever engaging — this cap exists specifically to
+  close that loophole.
+- A **bonus for actually firing while correctly facing the enemy**, and a **matching penalty for
+  firing while not facing it** (a guaranteed-miss shot) — these only trigger on genuine fire
+  attempts with ammo, never for passive facing, which is what keeps the facing-reward above
+  from being farmable on its own.
+- A **signed distance-closing term**: positive when a tick's movement reduced the distance to
+  the enemy, negative when it increased it. Over a full episode this telescopes down to just
+  the *net* distance closed (start position vs. end position) — oscillating back and forth
+  nets out to roughly zero, so it rewards genuine progress toward engagement range, not
+  meaningless wiggling.
+- **Large terminal bonuses/penalties** on episode end: a big bonus for winning, a big penalty
+  for losing, and a smaller (but still negative) penalty for timing out — timing out is
+  deliberately worse than winning but better than dying, since a stalemate at least didn't get
+  the soldier killed.
+
+### What's explicitly out of scope (for now)
+
+Carried over unchanged from the original design spec: no reload mechanic (ammo is one fixed
+pool per episode for both sides), no partial observability beyond the raw numbers already in
+the observation, no enemy movement or more sophisticated enemy behavior (self-play, evasion,
+etc.), no continuous/smooth orientation (bins are a deliberate choice to keep this a "pure"
+discrete-action DQN problem), and no obstacles or map complexity.
 
 ## Agents
 
