@@ -22,7 +22,7 @@ import pygame
 
 from envs import geometry
 
-_state = {"screen": None, "clock": None, "config": None}
+_state = {"screen": None, "clock": None, "config": None, "font": None}
 
 
 def _ensure_init(env, config):
@@ -37,6 +37,7 @@ def _ensure_init(env, config):
     _state["screen"] = pygame.display.set_mode((width_px, height_px))
     pygame.display.set_caption("dqn-combat-sim")
     _state["clock"] = pygame.time.Clock()
+    _state["font"] = pygame.font.Font(None, config["stats_text"]["font_size_px"])
 
 
 def _world_to_screen(pos, env):
@@ -46,6 +47,12 @@ def _world_to_screen(pos, env):
     x = margin + pos[0] * scale
     y = margin + (env.map_height - pos[1]) * scale  # flip so +y is "up" on screen
     return int(x), int(y)
+
+
+def _point_at_angle(center_px, angle_deg, length_px):
+    angle_rad = math.radians(angle_deg)
+    # screen y is flipped relative to world y (see _world_to_screen)
+    return (center_px[0] + length_px * math.cos(angle_rad), center_px[1] - length_px * math.sin(angle_rad))
 
 
 def _draw_hp_bar(screen, center_px, hp, max_hp, config):
@@ -61,10 +68,52 @@ def _draw_hp_bar(screen, center_px, hp, max_hp, config):
 def _draw_orientation(screen, center_px, orientation_bin, bin_size_degrees, color, config):
     length = config["orientation_indicator"]["length_px"]
     angle_deg = geometry.bin_to_angle_center(orientation_bin, bin_size_degrees)
-    angle_rad = math.radians(angle_deg)
-    # screen y is flipped relative to world y (see _world_to_screen)
-    end = (center_px[0] + length * math.cos(angle_rad), center_px[1] - length * math.sin(angle_rad))
+    end = _point_at_angle(center_px, angle_deg, length)
     pygame.draw.line(screen, color, center_px, end, 2)
+
+
+def _draw_range_wedge(screen, center_px, orientation_bin, bin_size_degrees, radius_px, color):
+    """Outline of the pie slice the entity's current orientation bin covers, out to gun
+    range — replaces a full range circle with just the bin-width slice actually being aimed."""
+    angle_center = geometry.bin_to_angle_center(orientation_bin, bin_size_degrees)
+    lo = angle_center - bin_size_degrees / 2.0
+    hi = angle_center + bin_size_degrees / 2.0
+    n_steps = max(2, int(bin_size_degrees / 6))  # ~6 degrees per arc segment
+    arc_points = [
+        _point_at_angle(center_px, lo + (hi - lo) * i / n_steps, radius_px)
+        for i in range(n_steps + 1)
+    ]
+    pygame.draw.line(screen, color, center_px, arc_points[0], 1)
+    pygame.draw.line(screen, color, center_px, arc_points[-1], 1)
+    pygame.draw.lines(screen, color, False, arc_points, 1)
+
+
+def _draw_fire_events(screen, env, config, radius_px):
+    """Every fire attempt this tick. The soldier's are always drawn — colored by whether it
+    was aimed at the enemy's true bearing, independent of whether the accuracy roll landed —
+    so a miss from bad aim reads differently from a miss from bad luck. The enemy (which
+    always aims correctly by design) still only shows its tracer on an actual hit."""
+    colors = config["colors"]
+    for fire_event in env.last_fire_events:
+        start_px = _world_to_screen(fire_event["position"], env)
+        if fire_event["shooter"] == "soldier":
+            color = colors["fire_correct"] if fire_event["facing_target"] else colors["fire_incorrect"]
+            if fire_event["hit"]:
+                end_px = _world_to_screen(fire_event["target_position"], env)
+            else:
+                angle_deg = geometry.bin_to_angle_center(fire_event["orientation_bin"], env.bin_size_degrees)
+                end_px = _point_at_angle(start_px, angle_deg, radius_px)
+            pygame.draw.line(screen, color, start_px, end_px, 2)
+        elif fire_event["hit"]:
+            end_px = _world_to_screen(fire_event["target_position"], env)
+            pygame.draw.line(screen, colors["tracer"], start_px, end_px, 2)
+
+
+def _draw_stats_text(screen, center_px, hp, max_hp, ammo, config):
+    text = f"HP {int(round(hp))}/{int(max_hp)}  AMMO {ammo}"
+    surface = _state["font"].render(text, True, config["colors"]["stats_text"])
+    rect = surface.get_rect(center=(center_px[0], center_px[1] - 36))
+    screen.blit(surface, rect)
 
 
 def render(env, config):
@@ -73,6 +122,7 @@ def render(env, config):
     config = _state["config"]  # config is locked in at init time since it determines window size
     colors = config["colors"]
     scale = config["window"]["scale_px_per_unit"]
+    range_px = env.max_range * scale
 
     screen.fill(colors["background"])
 
@@ -87,13 +137,10 @@ def render(env, config):
     soldier_px = _world_to_screen(env.soldier["position"], env)
     enemy_px = _world_to_screen(env.enemy["position"], env)
 
-    pygame.draw.circle(screen, colors["range_circle"], soldier_px, int(env.max_range * scale), 1)
+    _draw_range_wedge(screen, soldier_px, env.soldier["orientation_bin"], env.bin_size_degrees, range_px, colors["range_wedge_soldier"])
+    _draw_range_wedge(screen, enemy_px, env.enemy["orientation_bin"], env.bin_size_degrees, range_px, colors["range_wedge_enemy"])
 
-    for shooter_pos, target_pos in env.last_hit_events:
-        pygame.draw.line(
-            screen, colors["tracer"],
-            _world_to_screen(shooter_pos, env), _world_to_screen(target_pos, env), 2,
-        )
+    _draw_fire_events(screen, env, config, range_px)
 
     pygame.draw.circle(screen, colors["soldier"], soldier_px, 10)
     pygame.draw.circle(screen, colors["enemy"], enemy_px, 10)
@@ -104,6 +151,9 @@ def render(env, config):
     _draw_hp_bar(screen, soldier_px, env.soldier["hp"], env.soldier_max_hp, config)
     _draw_hp_bar(screen, enemy_px, env.enemy["hp"], env.enemy_max_hp, config)
 
+    _draw_stats_text(screen, soldier_px, env.soldier["hp"], env.soldier_max_hp, env.soldier["ammo"], config)
+    _draw_stats_text(screen, enemy_px, env.enemy["hp"], env.enemy_max_hp, env.enemy["ammo"], config)
+
     pygame.display.flip()
     _state["clock"].tick(config["window"]["fps"])
 
@@ -112,9 +162,18 @@ def render(env, config):
             close()
 
 
+def get_frame():
+    """Last-rendered frame as an (H, W, 3) uint8 RGB array, or None if render() hasn't
+    been called yet (or close() was already called). For video/GIF recording."""
+    if _state["screen"] is None:
+        return None
+    return pygame.surfarray.array3d(_state["screen"]).transpose(1, 0, 2)
+
+
 def close():
     if _state["screen"] is not None:
         pygame.quit()
         _state["screen"] = None
         _state["clock"] = None
         _state["config"] = None
+        _state["font"] = None

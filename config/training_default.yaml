@@ -73,8 +73,8 @@ train:
   # training/train.py, separate from the standard eval_log.csv eval (always full difficulty,
   # for one consistent metric across the whole run).
   curriculum:
-    enabled: true
-    win_rate_threshold: 0.7     # avg win_rate (curriculum-check eval) needed to advance a stage
+    enabled: truei 
+    win_rate_threshold: 0.6     # avg win_rate (curriculum-check eval) needed to advance a stage
     convergence_window: 4       # ...averaged over this many consecutive curriculum-check evals
     stages:
       - enemy_fire_enabled: false      # stage 0: no counter-fire at all — pure aim/engagement practice

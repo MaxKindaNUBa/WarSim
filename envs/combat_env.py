@@ -131,7 +131,7 @@ class CombatEnv(gym.Env):
         self.soldier = None
         self.enemy = None
         self.t = 0
-        self.last_hit_events = []
+        self.last_fire_events = []
 
     # -- Gymnasium API -----------------------------------------------------
 
@@ -162,7 +162,8 @@ class CombatEnv(gym.Env):
         self.enemy["orientation_bin"] = self._true_enemy_orientation_bin()
         self._enemy_reaction_counter = 0
         self.t = 0
-        self.last_hit_events = []  # [(shooter_pos, target_pos), ...] for the renderer's on-hit tracer
+        self.last_fire_events = []  # [{"shooter", "position", "orientation_bin", "facing_target",
+                                     #   "hit", "target_position"}, ...] for the renderer
 
         obs = self._get_obs()
         info = {}
@@ -180,18 +181,37 @@ class CombatEnv(gym.Env):
         distance_closed = prev_distance - geometry.distance(self.soldier["position"], self.enemy["position"])
         self._update_enemy_orientation()
 
+        # Computed here (post-move, pre-fire) since neither depends on fire resolution, and
+        # both the reward and the fire-event log below need them.
+        facing_enemy = self._soldier_facing_enemy()
+        enemy_facing_soldier = self._enemy_facing_soldier()
+
         soldier_ammo_before = self.soldier["ammo"]
         soldier_hit, soldier_damage, soldier_ammo_consumed, soldier_fire_executed = (
             self._resolve_soldier_fire(fire)
         )
         ammo_just_depleted = soldier_ammo_before > 0 and self.soldier["ammo"] == 0
-        enemy_hit, enemy_damage, _, _ = self._resolve_enemy_fire()
+        enemy_hit, enemy_damage, enemy_ammo_consumed, enemy_fire_executed = self._resolve_enemy_fire()
 
-        self.last_hit_events = []
-        if soldier_hit:
-            self.last_hit_events.append((tuple(self.soldier["position"]), tuple(self.enemy["position"])))
-        if enemy_hit:
-            self.last_hit_events.append((tuple(self.enemy["position"]), tuple(self.soldier["position"])))
+        self.last_fire_events = []
+        if soldier_fire_executed and soldier_ammo_consumed:
+            self.last_fire_events.append({
+                "shooter": "soldier",
+                "position": tuple(self.soldier["position"]),
+                "orientation_bin": self.soldier["orientation_bin"],
+                "facing_target": facing_enemy,
+                "hit": soldier_hit,
+                "target_position": tuple(self.enemy["position"]) if soldier_hit else None,
+            })
+        if enemy_fire_executed and enemy_ammo_consumed:
+            self.last_fire_events.append({
+                "shooter": "enemy",
+                "position": tuple(self.enemy["position"]),
+                "orientation_bin": self.enemy["orientation_bin"],
+                "facing_target": enemy_facing_soldier,
+                "hit": enemy_hit,
+                "target_position": tuple(self.soldier["position"]) if enemy_hit else None,
+            })
 
         self.enemy["hp"] = max(0.0, self.enemy["hp"] - soldier_damage)
         self.soldier["hp"] = max(0.0, self.soldier["hp"] - enemy_damage)
@@ -202,7 +222,6 @@ class CombatEnv(gym.Env):
 
         empty_gun_fire = soldier_fire_executed and not soldier_ammo_consumed
         real_fire_attempt = soldier_fire_executed and soldier_ammo_consumed
-        facing_enemy = self._soldier_facing_enemy()
         reward = self._get_reward(
             soldier_damage_dealt=soldier_damage,
             enemy_damage_taken=enemy_damage,
@@ -288,6 +307,11 @@ class CombatEnv(gym.Env):
         bearing = geometry.bearing(self.soldier["position"], self.enemy["position"])
         true_bin = geometry.angle_to_bin(bearing, self.bin_size_degrees)
         return ballistics.check_los(self.soldier["orientation_bin"], true_bin)
+
+    def _enemy_facing_soldier(self):
+        bearing = geometry.bearing(self.enemy["position"], self.soldier["position"])
+        true_bin = geometry.angle_to_bin(bearing, self.bin_size_degrees)
+        return ballistics.check_los(self.enemy["orientation_bin"], true_bin)
 
     def _table_config(self):
         return {

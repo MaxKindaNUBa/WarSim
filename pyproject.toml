@@ -13,6 +13,8 @@ dependencies = [
     "scipy",
     "pytest",
     "torch",
+    "imageio",
+    "imageio-ffmpeg",
 ]
 
 [tool.setuptools]
