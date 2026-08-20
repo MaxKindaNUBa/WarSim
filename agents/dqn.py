@@ -7,6 +7,7 @@ project trains on an RTX 4060 by design). Device selection fails loudly rather
 than silently falling back to CPU: DQNAgent.__init__ raises immediately if
 torch.cuda.is_available() is False.
 """
+import math
 import random
 
 import torch
@@ -52,6 +53,7 @@ class DQNAgent:
                  weight_decay=0.0, eps=1e-8, momentum=0.9, grad_clip_norm=None,
                  loss_fn="smooth_l1", target_update_mode="polyak", target_tau=0.005,
                  lr_decay_enabled=False, lr_end=None, lr_decay_steps=None,
+                 epsilon_mode="linear", vdbe_sigma=None, vdbe_delta=None,
                  seed=None):
         if not torch.cuda.is_available():
             raise RuntimeError(
@@ -64,6 +66,10 @@ class DQNAgent:
             raise ValueError(
                 f"Unknown target_update_mode '{target_update_mode}', expected 'hard' or 'polyak'"
             )
+        if epsilon_mode not in ("linear", "vdbe"):
+            raise ValueError(f"Unknown epsilon_mode '{epsilon_mode}', expected 'linear' or 'vdbe'")
+        if epsilon_mode == "vdbe" and vdbe_sigma is None:
+            raise ValueError("epsilon_mode='vdbe' requires vdbe_sigma (train.epsilon.vdbe.sigma)")
         self.device = torch.device("cuda")
 
         self.n_actions = n_actions
@@ -83,6 +89,19 @@ class DQNAgent:
         # so curriculum stage changes can re-inject exploration without restarting the agent.
         self._epsilon_anchor_step = 0
         self._epsilon_anchor_value = epsilon_start
+
+        # VDBE (Tokic 2010, AdaptiveEpsilonGreedyExploration.pdf): epsilon_at ignores the
+        # linear schedule entirely and returns this self-regulating value instead, updated
+        # every train_step() from the batch's TD-error magnitude via _update_vdbe_epsilon.
+        # epsilon_bump is a permanent no-op in this mode (see bump_epsilon) -- VDBE already
+        # re-inflates its own epsilon whenever TD-error rises (e.g. a curriculum stage change
+        # making the environment newly unfamiliar), so the anchor-reset mechanism designed for
+        # the fixed-clock linear schedule has nothing to do here.
+        self.epsilon_mode = epsilon_mode
+        self.vdbe_sigma = vdbe_sigma
+        self.vdbe_delta = vdbe_delta if vdbe_delta is not None else (1.0 / n_actions)
+        self._vdbe_epsilon = epsilon_start
+        self._last_vdbe_value_diff = None
 
         # Linear LR decay over train_step() count (gradient updates, not env steps) — see
         # train.optim.lr_decay in config/training_default.yaml. Off by default (lr_at just
@@ -126,6 +145,8 @@ class DQNAgent:
         network = train_config["network"]
         optim_cfg = train_config["optim"]
         lr_decay_cfg = optim_cfg.get("lr_decay", {})
+        epsilon_cfg = train_config["epsilon"]
+        vdbe_cfg = epsilon_cfg.get("vdbe", {})
         return cls(
             obs_dim=obs_dim,
             n_actions=n_actions,
@@ -142,12 +163,15 @@ class DQNAgent:
             target_update_mode=train_config["target_network"].get("update_mode", "polyak"),
             target_tau=train_config["target_network"].get("tau", 0.005),
             target_sync_interval_steps=train_config["target_network"].get("sync_interval_steps", 1000),
-            epsilon_start=train_config["epsilon"]["start"],
-            epsilon_end=train_config["epsilon"]["end"],
-            epsilon_decay_steps=train_config["epsilon"]["decay_steps"],
+            epsilon_start=epsilon_cfg["start"],
+            epsilon_end=epsilon_cfg["end"],
+            epsilon_decay_steps=epsilon_cfg.get("decay_steps"),
             lr_decay_enabled=lr_decay_cfg.get("enabled", False),
             lr_end=lr_decay_cfg.get("end_learning_rate"),
             lr_decay_steps=lr_decay_cfg.get("decay_steps"),
+            epsilon_mode=epsilon_cfg.get("mode", "linear"),
+            vdbe_sigma=vdbe_cfg.get("sigma"),
+            vdbe_delta=vdbe_cfg.get("delta"),
             seed=seed,
         )
 
@@ -158,9 +182,27 @@ class DQNAgent:
         return self.lr_start + frac * (self.lr_end - self.lr_start)
 
     def epsilon_at(self, global_step):
+        if self.epsilon_mode == "vdbe":
+            return self._vdbe_epsilon
         effective_step = max(0, global_step - self._epsilon_anchor_step)
         frac = min(1.0, effective_step / max(1, self.epsilon_decay_steps))
         return self._epsilon_anchor_value + frac * (self.epsilon_end - self._epsilon_anchor_value)
+
+    def _update_vdbe_epsilon(self, value_diff):
+        """VDBE-Boltzmann update (Tokic 2010, Eq. 6-7): f = (1-e^-x)/(1+e^-x) where
+        x = |value_diff|/sigma, then epsilon <- delta*f + (1-delta)*epsilon. value_diff is the
+        paper's "alpha * TD-error" (Eq. 6) -- here, the current effective learning rate times
+        the batch's mean |TD-error|, translating the paper's single-update, single-state-MDP
+        formula to a minibatch update over a large state space (same adaptation the paper's
+        Section 5 says preserves the underlying principle: "the mathematical principle remains
+        the same in multi-state MDPs"). No artificial floor/ceiling is applied -- per the paper,
+        epsilon is a convex combination of two values already in [0, 1], so it stays in [0, 1]
+        by construction, and is expected to converge toward 0 as the Q-function converges.
+        """
+        x = abs(value_diff) / self.vdbe_sigma
+        f = (1.0 - math.exp(-x)) / (1.0 + math.exp(-x))
+        self._vdbe_epsilon = self.vdbe_delta * f + (1.0 - self.vdbe_delta) * self._vdbe_epsilon
+        return self._vdbe_epsilon
 
     def bump_epsilon(self, global_step, value=None):
         """Re-inject exploration by resetting the decay anchor here — e.g. on a curriculum
@@ -178,13 +220,17 @@ class DQNAgent:
         a "bump" should only ever raise exploration, never lower it (e.g. curriculum advancing
         early, while the initial cold-start decay hasn't dropped below the bump target yet).
         Returns True if the bump was applied, False if skipped for that reason.
+
+        Always a no-op in epsilon_mode="vdbe": VDBE self-regulates from TD-error instead of a
+        fixed-clock schedule, so there is no decay anchor here to reset -- see __init__.
         """
+        if self.epsilon_mode == "vdbe":
+            return False
         target_value = self.epsilon_start if value is None else value
         if target_value <= self.epsilon_at(global_step):
             return False
         self._epsilon_anchor_step = global_step
         self._epsilon_anchor_value = target_value
-        return True
         return True
 
     def act(self, obs, global_step, greedy=False):
@@ -229,10 +275,10 @@ class DQNAgent:
         else:
             loss = elementwise_loss.mean()
 
+        effective_lr = self.lr_at(self._train_steps) if self.lr_decay_enabled else self.lr_start
         if self.lr_decay_enabled:
-            current_lr = self.lr_at(self._train_steps)
             for group in self.optimizer.param_groups:
-                group["lr"] = current_lr
+                group["lr"] = effective_lr
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -242,6 +288,11 @@ class DQNAgent:
 
         self._train_steps += 1
         self._update_target_network()
+
+        if self.epsilon_mode == "vdbe":
+            value_diff = effective_lr * td_errors.mean().item()
+            self._last_vdbe_value_diff = value_diff
+            self._update_vdbe_epsilon(value_diff)
 
         return loss.item(), td_errors.cpu().numpy()
 
@@ -263,6 +314,7 @@ class DQNAgent:
             "target_network": self.target_network.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "train_steps": self._train_steps,
+            "vdbe_epsilon": self._vdbe_epsilon,
         }, path)
 
     def load_checkpoint(self, path):
@@ -271,3 +323,4 @@ class DQNAgent:
         self.target_network.load_state_dict(ckpt["target_network"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self._train_steps = ckpt["train_steps"]
+        self._vdbe_epsilon = ckpt.get("vdbe_epsilon", self.epsilon_start)

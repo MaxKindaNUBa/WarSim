@@ -204,6 +204,30 @@ def test_reward_penalty_for_firing_while_not_facing_enemy():
     assert reward == pytest.approx(-0.01 - 0.05)
 
 
+def test_reward_for_firing_near_but_not_exactly_facing_enemy_is_graded():
+    env = _make_env(gun={
+        "max_ammo": 5, "max_range": 100.0, "fire_cooldown_steps": 0,
+        "accuracy_table": {"distances": [0, 100], "values": [0.0, 0.0]},
+        "damage_table": {"distances": [0, 100], "values": [0.0, 0.0]},
+    })
+    env.reset(seed=6)
+    true_bin = _orientation_bin_toward_enemy(env)
+    near_bin = (true_bin + 1) % env.n_bins  # one bin off, not an exact LOS match
+    action = 1 * env.n_bins + near_bin  # move_dir=0, fire=1
+
+    obs, reward, terminated, truncated, info = env.step(action)
+
+    # linear interpolation over circular bin distance (bin_distance=1 of max n_bins//2=18):
+    # frac = 1/18 -> reward = 0.5*(1 - 1/18) + (-0.5)*(1/18), plus the flat step penalty
+    max_bin_distance = env.n_bins // 2
+    frac = 1 / max_bin_distance
+    expected_bearing_term = 0.05 * (1.0 - frac) + (-0.05) * frac
+    assert reward == pytest.approx(-0.01 + expected_bearing_term)
+    # strictly better than firing dead-opposite (-0.05 full penalty), strictly worse than an
+    # exact match (+0.05 full bonus) -- a real gradient, not a cliff
+    assert -0.01 - 0.05 < reward < -0.01 + 0.05
+
+
 def test_facing_enemy_reward_applies_every_tick_even_without_firing():
     env = _make_env(reward_overrides={"facing_enemy_reward": 0.005})
     env.reset(seed=6)

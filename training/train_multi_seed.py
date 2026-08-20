@@ -147,9 +147,9 @@ if __name__ == "__main__":
         description="Train the same config across multiple seeds concurrently, "
                      "one OS process per seed, sharing the GPU."
     )
-    parser.add_argument("--seeds", default="324,235,34215,34562,45656,2467,536735,78356,2457,567,7529,25687,1457653,25671658,41567257,1457456,7256756,1345315",
+    parser.add_argument("--seeds", default="324,235,34215,34562,45656,2467,536735,78356,2457,567,7529,25687,1457653,25671658,41567257,14574",
                          help="Comma-separated seeds and/or ranges, e.g. '1,2,3' or '0-4' or '1,5-7,20'")
-    parser.add_argument("--run-name", default="dqn_v3_PER_curriculum")
+    parser.add_argument("--run-name", default="dqn_v6_vdbe_sigma_15",)
     parser.add_argument("--max-parallel", type=int, default=3,
                          help="Max concurrent training processes (default: cpu_count - 2)")
     parser.add_argument("--env-config", default=None,

@@ -185,7 +185,15 @@ def train(run_name="dqn_v1", env_config=None, agent_config=None, reward_config=N
             curriculum_stage_idx += 1
             curriculum_win_rate_history.clear()
             _apply_curriculum_stage(curriculum_stage_idx)
-            if epsilon_bump_enabled:
+            if agent.epsilon_mode == "vdbe":
+                # bump_epsilon is a permanent no-op in this mode (agents/dqn.py) -- VDBE
+                # re-inflates its own epsilon from TD-error as the new stage's dynamics start
+                # producing larger errors, instead of needing a fixed-schedule reset here.
+                logger.info(
+                    "Epsilon bump: n/a at step %d (epsilon_mode=vdbe, self-regulates from TD-error)",
+                    global_step,
+                )
+            elif epsilon_bump_enabled:
                 bumped = agent.bump_epsilon(global_step, value=epsilon_bump_value)
                 if bumped:
                     logger.info(
@@ -344,6 +352,8 @@ def train(run_name="dqn_v1", env_config=None, agent_config=None, reward_config=N
                     writer.add_scalar("train/learning_rate", agent.optimizer.param_groups[0]["lr"], global_step)
                     if last_loss is not None:
                         writer.add_scalar("train/loss", last_loss, global_step)
+                    if agent.epsilon_mode == "vdbe" and agent._last_vdbe_value_diff is not None:
+                        writer.add_scalar("train/vdbe_value_diff", agent._last_vdbe_value_diff, global_step)
                     _flush_episode_window(global_step)
 
                 if buffer_seeding_enabled and global_step % buffer_seeding_interval_steps == 0:

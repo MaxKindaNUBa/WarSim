@@ -7,7 +7,8 @@
 # reward = step_penalty + hit_reward_scale*damage_dealt - damage_taken_penalty_scale*damage_taken
 #        + ammo_depleted_penalty (once, the tick ammo hits 0)
 #        + facing_enemy_reward (dense, every tick, facing the enemy's true bearing bin)
-#        + fire_while_facing_bonus / fire_while_not_facing_penalty (real fire attempts only)
+#        + fire_while_facing_bonus / fire_while_not_facing_penalty (real fire attempts only,
+#          graded linearly by orientation-bin distance from the enemy's true bearing -- see below)
 #        + distance_closing_reward_scale * (distance closed this tick, signed)
 #        + terminal.{win,lose,timeout}
 reward:
@@ -36,8 +37,20 @@ reward:
 
   # Real fire attempts only (ammo available, off cooldown) — never for passively facing
   # without firing, which used to create a "look but never shoot" local optimum.
-  fire_while_facing_bonus: 0.5          # fired while facing the enemy's true bearing bin
-  fire_while_not_facing_penalty: -0.5   # fired while not facing it (guaranteed miss)
+  #
+  # Graded, not binary (envs/combat_env.py: _get_reward): linearly interpolated over circular
+  # orientation-bin distance from the enemy's true bearing bin, 0 (exact match) to n_bins//2
+  # (dead opposite) -- exact match still pays the full fire_while_facing_bonus and dead-opposite
+  # still pays the full fire_while_not_facing_penalty (unchanged from the old binary version),
+  # but everything in between now gets a proportional in-between reward instead of the full
+  # penalty. The old all-or-nothing version (only an EXACT bin match, 1-in-n_bins by chance,
+  # ever paid off) gave zero gradient toward incrementally improving aim -- a near-miss was
+  # rewarded identically to a 180-degree-off shot -- which correlated with trained policies
+  # collapsing to firing less and less over training rather than learning to aim (see
+  # dqn_v6_long_curriculum_and_episodes run: avg_shots_fired trending to ~0 across all seeds
+  # despite zero counter-fire risk at curriculum stage 0).
+  fire_while_facing_bonus: 0.5          # fired at bin distance 0 (exact match)
+  fire_while_not_facing_penalty: -0.5   # fired at bin distance n_bins//2 (dead opposite)
 
   # Signed & symmetric: scale * (distance_before - distance_after). Telescopes to net
   # progress over the episode (can't be farmed by oscillating); ~0 once range is held steady.
@@ -73,7 +86,7 @@ train:
   # training/train.py, separate from the standard eval_log.csv eval (always full difficulty,
   # for one consistent metric across the whole run).
   curriculum:
-    enabled: truei 
+    enabled: true 
     win_rate_threshold: 0.6     # avg win_rate (curriculum-check eval) needed to advance a stage
     convergence_window: 4       # ...averaged over this many consecutive curriculum-check evals
     stages:
@@ -151,7 +164,17 @@ train:
 
   optim:
     learning_rate: 0.0002
-    gamma: 0.99                     # discount factor
+    # discount factor. Reverted to v3's 0.99 -- gamma=0.995 (isolated, single-variable test vs
+    # v3) made every seed in an 16-seed sweep collapse to exactly 0.0 win_rate by step 1M despite
+    # several peaking at 0.11-0.22 mid-run, and NO seed reached the final curriculum stage
+    # (v3 had 6/18 seeds reach it). Slower value convergence under the larger discount + epsilon/
+    # LR schedules tuned for 0.99's faster convergence meant exploration/LR floored out while
+    # curriculum was still stuck below full difficulty. Note: this reopens the original problem
+    # that motivated raising gamma -- at 0.99, strategy_compare.json shows the hold-range-then-
+    # rush tactic isn't even the discounted-optimal policy (201.2 vs 240.8 for the aggressor
+    # strategy), so DQN is unlikely to discover it at this gamma. Deliberately deferred until
+    # the graded fire-bearing reward (below) has been evaluated against v3 in isolation.
+    gamma: 0.99                      # discount factor
     optimizer_type: adam            # adam | sgd | rmsprop
     weight_decay: 0.0
     eps: 1.0e-8                     # adam/rmsprop only
@@ -181,9 +204,48 @@ train:
     sync_interval_steps: 1_000       # hard only: exact online -> target copy every N train_step() calls
 
   epsilon:
+    # linear = fixed step-count decay (decay_steps below), optionally re-injected on curriculum
+    # stage advances via epsilon_bump above. vdbe = Tokic (2010) Value-Difference Based
+    # Exploration (AdaptiveEpsilonGreedyExploration.pdf in repo root; agents/dqn.py:
+    # DQNAgent.epsilon_at/_update_vdbe_epsilon/train_step) -- a single adaptive epsilon driven
+    # by the Q-function's own TD-error instead of a clock, so it naturally stays elevated while
+    # something (a curriculum stage, or anything else) is still poorly learned and decays toward
+    # greedy only once value estimates actually settle. epsilon_bump is a permanent no-op in
+    # this mode (see agents/dqn.py:bump_epsilon and training/train.py's curriculum-advance
+    # block) -- VDBE re-inflates its own epsilon from rising TD-error as a new stage's dynamics
+    # take effect, so the fixed-schedule reset has nothing to do. Left at "linear" by default --
+    # see vdbe.sigma below for why this needs a short calibration run before flipping it on.
+    mode: vdbe                 # linear | vdbe
     start: 1.0
-    end: 0.01
-    decay_steps: 300_000          # linear decay length, in env steps
+    end: 0.01                     # also VDBE's natural floor as the Q-function converges (not
+                                    # an artificial clamp -- epsilon is a convex combination of
+                                    # values in [0,1], so it settles near 0 on its own; see
+                                    # _update_vdbe_epsilon)
+    decay_steps: 300_000          # linear mode only, in env steps
+
+    # vdbe mode only. sigma ("inverse sensitivity") is the one genuinely sensitive knob: f()
+    # saturates toward 1 (push epsilon up) when |value_diff| >> sigma and toward 0 (push epsilon
+    # down) when |value_diff| << sigma, where value_diff = current_lr * mean(|TD-error| over the
+    # batch). Tokic's own bandit experiments needed sigma swept over [0.04, 25] because that's
+    # calibrated to ~N(0,1)-scale rewards; this env's rewards/Q-values are a very different
+    # scale, so 0.04-25 does NOT transfer here.
+    #
+    # sigma=0.002 is calibrated, not guessed: a 30,000-step in-process pilot (real env/agent/
+    # replay-buffer, epsilon_mode left at linear so sigma had zero influence on what was
+    # collected) recorded the actual value_diff trace produced by this codebase --
+    # min=0.00025, p10=0.0016, median=0.0035, p90=0.0051, max=0.0084 -- then replayed that same
+    # trace offline through _update_vdbe_epsilon for a sweep of candidate sigmas. The previous
+    # guess, sigma=0.01, collapsed epsilon to ~0.20 within that same 30k-step window -- before
+    # the agent could plausibly have learned enough to justify exploiting that hard (curriculum
+    # stage 0 hadn't even converged yet). sigma=0.002 keeps epsilon in a still-declining but
+    # substantial ~0.65-0.74 range over the same window (vs. ~0.90 for the old linear schedule
+    # at the equivalent point) -- decaying in response to real uncertainty, without the
+    # premature-exploitation collapse. Still only a 30k-step pilot on curriculum stage 0, not a
+    # full run -- recheck against train/vdbe_value_diff once curriculum stages start advancing,
+    # since TD-error scale may shift as the enemy gets harder.
+    vdbe:
+      sigma: 15
+      delta: null                 # null -> 1/n_actions (Tokic's "obvious setting", section 3)
 
   train_every_n_steps: 4            # env steps per train_step() call
 

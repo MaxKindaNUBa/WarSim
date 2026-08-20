@@ -68,3 +68,20 @@ def test_bin_roundtrip_center_maps_to_same_bin():
     for b in range(n_bins):
         center = geometry.bin_to_angle_center(b, bin_size)
         assert geometry.angle_to_bin(center, bin_size) == b
+
+
+def test_bin_distance_exact_match_is_zero():
+    assert geometry.bin_distance(3, 3, 36) == 0
+
+
+def test_bin_distance_opposite_is_max():
+    assert geometry.bin_distance(0, 18, 36) == 18  # n_bins//2, dead opposite
+
+
+def test_bin_distance_takes_shorter_way_around_the_wrap():
+    # bins 1 and 35 (of 36) are adjacent going the other way around 0/360
+    assert geometry.bin_distance(1, 35, 36) == 2
+
+
+def test_bin_distance_is_symmetric():
+    assert geometry.bin_distance(5, 20, 36) == geometry.bin_distance(20, 5, 36)

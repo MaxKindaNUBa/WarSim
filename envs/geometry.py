@@ -25,3 +25,9 @@ def angle_to_bin(angle, bin_size_degrees):
 
 def bin_to_angle_center(bin_idx, bin_size_degrees):
     return bin_idx * bin_size_degrees + bin_size_degrees / 2.0
+
+
+def bin_distance(bin_a, bin_b, n_bins):
+    """Circular distance between two orientation bins: 0 (exact match) to n_bins//2 (opposite)."""
+    diff = abs(bin_a - bin_b) % n_bins
+    return min(diff, n_bins - diff)

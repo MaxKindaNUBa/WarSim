@@ -222,13 +222,13 @@ class CombatEnv(gym.Env):
 
         empty_gun_fire = soldier_fire_executed and not soldier_ammo_consumed
         real_fire_attempt = soldier_fire_executed and soldier_ammo_consumed
+        fire_bearing_bin_distance = self._soldier_bearing_bin_distance() if real_fire_attempt else None
         reward = self._get_reward(
             soldier_damage_dealt=soldier_damage,
             enemy_damage_taken=enemy_damage,
             ammo_just_depleted=ammo_just_depleted,
             facing_enemy=facing_enemy,
-            fired_while_facing_enemy=real_fire_attempt and facing_enemy,
-            fired_while_not_facing_enemy=real_fire_attempt and not facing_enemy,
+            fire_bearing_bin_distance=fire_bearing_bin_distance,
             distance_closed=distance_closed,
             outcome=outcome,
         )
@@ -308,6 +308,11 @@ class CombatEnv(gym.Env):
         true_bin = geometry.angle_to_bin(bearing, self.bin_size_degrees)
         return ballistics.check_los(self.soldier["orientation_bin"], true_bin)
 
+    def _soldier_bearing_bin_distance(self):
+        bearing = geometry.bearing(self.soldier["position"], self.enemy["position"])
+        true_bin = geometry.angle_to_bin(bearing, self.bin_size_degrees)
+        return geometry.bin_distance(self.soldier["orientation_bin"], true_bin, self.n_bins)
+
     def _enemy_facing_soldier(self):
         bearing = geometry.bearing(self.enemy["position"], self.soldier["position"])
         true_bin = geometry.angle_to_bin(bearing, self.bin_size_degrees)
@@ -357,7 +362,7 @@ class CombatEnv(gym.Env):
         return False, None
 
     def _get_reward(self, soldier_damage_dealt, enemy_damage_taken, ammo_just_depleted, facing_enemy,
-                     fired_while_facing_enemy, fired_while_not_facing_enemy, distance_closed, outcome):
+                     fire_bearing_bin_distance, distance_closed, outcome):
         reward = self.step_penalty
         reward += self.hit_reward_scale * soldier_damage_dealt
         reward -= self.damage_taken_penalty_scale * enemy_damage_taken
@@ -365,10 +370,18 @@ class CombatEnv(gym.Env):
             reward += self.ammo_depleted_penalty
         if facing_enemy:
             reward += self.facing_enemy_reward
-        if fired_while_facing_enemy:
-            reward += self.fire_while_facing_bonus
-        if fired_while_not_facing_enemy:
-            reward += self.fire_while_not_facing_penalty
+        if fire_bearing_bin_distance is not None:
+            # Linear interpolation over circular bin distance (0 = exact match, n_bins//2 =
+            # dead opposite) instead of an all-or-nothing exact-match bonus/penalty. Endpoints
+            # are unchanged (0 -> fire_while_facing_bonus, n_bins//2 -> fire_while_not_facing_
+            # penalty) so existing exact-match/exact-opposite behavior is preserved; everything
+            # in between now gives a graded signal instead of treating "1 bin off" the same as
+            # "180 degrees off" -- see conversation/runs analysis: the exact-match-only version
+            # gave zero gradient toward incrementally improving aim, which correlated with
+            # trained policies collapsing to never firing at all rather than learning to aim.
+            max_bin_distance = self.n_bins // 2
+            frac = fire_bearing_bin_distance / max_bin_distance if max_bin_distance else 0.0
+            reward += self.fire_while_facing_bonus * (1.0 - frac) + self.fire_while_not_facing_penalty * frac
         # Signed: positive when the soldier's move this tick reduced distance to the enemy,
         # negative when it increased it. Telescopes to scale * (initial_dist - final_dist)
         # over a whole episode, so oscillating back and forth nets ~0 — it can't be farmed,
